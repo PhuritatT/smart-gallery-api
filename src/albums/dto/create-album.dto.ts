@@ -1,5 +1,5 @@
 // Create Album DTO - Created: 2026-01-02
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, ValidateIf } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateAlbumDto {
@@ -13,8 +13,9 @@ export class CreateAlbumDto {
     @IsString()
     title: string;
 
-    @ApiPropertyOptional({ example: 'https://...', description: 'Cover image URL' })
+    @ApiPropertyOptional({ example: 'https://...', description: 'Cover image URL', nullable: true })
     @IsOptional()
+    @ValidateIf((_, value) => value !== null) // 2026-02-08: Skip validation if null (for removal)
     @IsString()
-    coverImageUrl?: string;
+    coverImageUrl?: string | null;
 }
