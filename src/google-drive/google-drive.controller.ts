@@ -16,6 +16,16 @@ import { Public } from '../common/decorators/public.decorator';
 export class GoogleDriveController {
     constructor(private readonly googleDriveService: GoogleDriveService) { }
 
+    private sanitizeFilename(fileName: string): string {
+        return fileName.replace(/[\r\n"]/g, '').trim() || 'download';
+    }
+
+    private shouldDownload(download?: string): boolean {
+        if (!download) return false;
+
+        return ['1', 'true', 'yes'].includes(download.toLowerCase());
+    }
+
     @Public()
     @Get('files')
     @ApiOperation({ summary: 'List images in a Google Drive folder' })
@@ -37,22 +47,30 @@ export class GoogleDriveController {
         description: 'This endpoint streams image data to bypass CORS restrictions for Face Search'
     })
     @ApiQuery({ name: 'fileId', required: true, description: 'Google Drive file ID' })
+    @ApiQuery({
+        name: 'download',
+        required: false,
+        description: 'When set, returns attachment headers for file download',
+    })
     @ApiResponse({ status: 200, description: 'Returns image binary stream' })
     @ApiResponse({ status: 404, description: 'File not found' })
     async proxyFile(
         @Query('fileId') fileId: string,
         @Res() res: Response,
+        @Query('download') download?: string,
     ) {
         if (!fileId) {
             throw new BadRequestException('fileId is required');
         }
 
         const { stream, mimeType, fileName } = await this.googleDriveService.getFileStream(fileId);
+        const sanitizedFileName = this.sanitizeFilename(fileName);
+        const dispositionType = this.shouldDownload(download) ? 'attachment' : 'inline';
 
         // Set headers for image response
         res.set({
             'Content-Type': mimeType,
-            'Content-Disposition': `inline; filename="${fileName}"`,
+            'Content-Disposition': `${dispositionType}; filename="${sanitizedFileName}"; filename*=UTF-8''${encodeURIComponent(sanitizedFileName)}`,
             'Cache-Control': 'public, max-age=86400', // Cache for 24 hours
             'Access-Control-Allow-Origin': '*', // Allow CORS for face-api.js
         });
