@@ -7,6 +7,7 @@ import {
   type GetObjectCommandOutput,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'stream';
 
 interface CacheKeyInput {
@@ -22,11 +23,25 @@ interface CachedImage {
   fileName?: string;
 }
 
+interface SignedReadUrlOptions {
+  fileName: string;
+  mimeType: string;
+  download?: boolean;
+}
+
+interface SignedReadUrl {
+  url: string;
+  expiresAt: Date;
+}
+
 @Injectable()
 export class DriveImageCacheService {
   private readonly logger = new Logger(DriveImageCacheService.name);
   private readonly client?: S3Client;
   private readonly bucketName?: string;
+  private readonly signedUrlCache = new Map<string, SignedReadUrl>();
+  private readonly signedUrlExpiresInSeconds = 300;
+  private readonly signedUrlCacheSkewMs = 30000;
 
   constructor(private readonly configService: ConfigService) {
     const endpoint = this.configService.get<string>('R2_ENDPOINT');
@@ -106,6 +121,46 @@ export class DriveImageCacheService {
     }
   }
 
+  async getSignedReadUrl(
+    key: string,
+    options: SignedReadUrlOptions,
+  ): Promise<SignedReadUrl> {
+    if (!this.client || !this.bucketName) {
+      throw new Error('R2 cache is not configured');
+    }
+
+    const dispositionType = options.download ? 'attachment' : 'inline';
+    const sanitizedFileName = this.sanitizeContentDispositionFileName(options.fileName);
+    const disposition = `${dispositionType}; filename="${sanitizedFileName}"; filename*=UTF-8''${encodeURIComponent(sanitizedFileName)}`;
+    const cacheKey = [
+      key,
+      options.mimeType,
+      disposition,
+    ].join('|');
+    const cached = this.signedUrlCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && cached.expiresAt.getTime() - this.signedUrlCacheSkewMs > now) {
+      return cached;
+    }
+
+    const expiresAt = new Date(now + this.signedUrlExpiresInSeconds * 1000);
+    const command = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+      ResponseContentType: options.mimeType,
+      ResponseContentDisposition: disposition,
+      ResponseCacheControl: 'public, max-age=86400',
+    });
+    const url = await getSignedUrl(this.client, command, {
+      expiresIn: this.signedUrlExpiresInSeconds,
+    });
+    const signedUrl = { url, expiresAt };
+
+    this.signedUrlCache.set(cacheKey, signedUrl);
+    return signedUrl;
+  }
+
   async uploadStream(
     key: string,
     stream: Readable,
@@ -150,6 +205,10 @@ export class DriveImageCacheService {
         .trim()
         .slice(0, 180) || 'download'
     );
+  }
+
+  private sanitizeContentDispositionFileName(value: string): string {
+    return value.replace(/[\r\n"]/g, '').trim() || 'download';
   }
 
   private toReadable(body: GetObjectCommandOutput['Body']): Readable {

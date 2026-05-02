@@ -13,12 +13,26 @@ export interface DriveFileStreamContext {
     mimeType?: string;
 }
 
+export interface DriveFileUrlOptions {
+    baseUrl: string;
+    download?: boolean;
+}
+
+export interface DriveFileUrlResult {
+    url: string;
+    source: 'r2' | 'proxy';
+    expiresAt?: string;
+}
+
 @Injectable()
 export class GoogleDriveService {
     private readonly logger = new Logger(GoogleDriveService.name);
     private readonly apiKey: string;
     private readonly baseUrl = 'https://www.googleapis.com/drive/v3';
     private readonly folderNameCache = new Map<string, string | null>();
+    private readonly fileListCache = new Map<string, { files: DriveFile[]; expiresAt: number }>();
+    private readonly prewarmInFlight = new Set<string>();
+    private readonly fileListCacheTtlMs = 30000;
 
     constructor(
         private readonly configService: ConfigService,
@@ -121,6 +135,12 @@ export class GoogleDriveService {
      */
     async listFiles(folderId: string): Promise<DriveFile[]> {
         const extractedId = this.extractFolderId(folderId);
+        const cached = this.fileListCache.get(extractedId);
+
+        if (cached && cached.expiresAt > Date.now()) {
+            this.startFolderPrewarm(extractedId, cached.files);
+            return cached.files;
+        }
 
         const query = `'${extractedId}' in parents and mimeType contains 'image/' and trashed = false`;
         // Added modifiedTime for sorting
@@ -138,6 +158,10 @@ export class GoogleDriveService {
 
             const data = await response.json();
             const files = data.files || [];
+            this.fileListCache.set(extractedId, {
+                files,
+                expiresAt: Date.now() + this.fileListCacheTtlMs,
+            });
             this.startFolderPrewarm(extractedId, files);
             return files;
         } catch (error) {
@@ -210,6 +234,40 @@ export class GoogleDriveService {
         }
     }
 
+    async getCachedFileUrl(
+        fileId: string,
+        context: DriveFileStreamContext,
+        options: DriveFileUrlOptions,
+    ): Promise<DriveFileUrlResult> {
+        const metadata = await this.resolveMetadata(fileId, context);
+        const cacheKey = await this.getCacheKey(fileId, metadata, context);
+
+        if (cacheKey && this.imageCacheService?.isEnabled()) {
+            try {
+                if (await this.imageCacheService.exists(cacheKey)) {
+                    const signedUrl = await this.imageCacheService.getSignedReadUrl(cacheKey, {
+                        fileName: metadata.name,
+                        mimeType: metadata.mimeType,
+                        download: options.download,
+                    });
+
+                    return {
+                        url: signedUrl.url,
+                        source: 'r2',
+                        expiresAt: signedUrl.expiresAt.toISOString(),
+                    };
+                }
+            } catch (error) {
+                this.logger.warn(`R2 signed URL failed for file ${fileId}: ${error}`);
+            }
+        }
+
+        return {
+            url: this.getProxyUrl(fileId, options.baseUrl, context, options.download),
+            source: 'proxy',
+        };
+    }
+
     getThumbnailUrl(fileId: string): string {
         return `https://drive.google.com/thumbnail?id=${fileId}&sz=w400`;
     }
@@ -218,8 +276,21 @@ export class GoogleDriveService {
         return `https://drive.google.com/uc?export=download&id=${fileId}`;
     }
 
-    getProxyUrl(fileId: string, baseUrl: string): string {
-        return `${baseUrl}/drive/proxy?fileId=${fileId}`;
+    getProxyUrl(
+        fileId: string,
+        baseUrl: string,
+        context: DriveFileStreamContext = {},
+        download?: boolean,
+    ): string {
+        const params = new URLSearchParams({ fileId });
+
+        if (download) params.set('download', '1');
+        if (context.folderId) params.set('folderId', context.folderId);
+        if (context.folderName) params.set('folderName', context.folderName);
+        if (context.fileName) params.set('fileName', context.fileName);
+        if (context.mimeType) params.set('mimeType', context.mimeType);
+
+        return `${baseUrl}/drive/proxy?${params.toString()}`;
     }
 
     /**
@@ -331,10 +402,16 @@ export class GoogleDriveService {
 
     private startFolderPrewarm(folderId: string, files: DriveFile[]): void {
         if (!this.imageCacheService?.isEnabled()) return;
+        if (this.prewarmInFlight.has(folderId)) return;
 
-        void this.prewarmFolderCache(folderId, files).catch((error) => {
-            this.logger.warn(`R2 folder prewarm failed for folder ${folderId}: ${error}`);
-        });
+        this.prewarmInFlight.add(folderId);
+        void this.prewarmFolderCache(folderId, files)
+            .catch((error) => {
+                this.logger.warn(`R2 folder prewarm failed for folder ${folderId}: ${error}`);
+            })
+            .finally(() => {
+                this.prewarmInFlight.delete(folderId);
+            });
     }
 
     private async prewarmFolderCache(folderId: string, files: DriveFile[]): Promise<void> {
