@@ -18,6 +18,74 @@ export class GoogleDriveService {
         }
     }
 
+    private async readDriveError(response: Response, fallbackMessage: string): Promise<string> {
+        const statusLabel = [response.status, response.statusText].filter(Boolean).join(' ');
+        let responseBody = '';
+
+        try {
+            responseBody = await response.text();
+        } catch {
+            responseBody = '';
+        }
+
+        if (responseBody) {
+            try {
+                const error = JSON.parse(responseBody);
+                const message = error.error?.message || error.message;
+                if (message) {
+                    return `${fallbackMessage} (${statusLabel}): ${message}`;
+                }
+            } catch {
+                const preview = responseBody.replace(/\s+/g, ' ').trim().slice(0, 200);
+                if (preview) {
+                    return `${fallbackMessage} (${statusLabel}): ${preview}`;
+                }
+            }
+        }
+
+        return `${fallbackMessage} (${statusLabel})`;
+    }
+
+    private createNodeStream(webStream: ReadableStream<Uint8Array> | null): Readable {
+        if (!webStream) {
+            throw new Error('No response body');
+        }
+
+        const reader = webStream.getReader();
+        return new Readable({
+            async read() {
+                const { done, value } = await reader.read();
+                if (done) {
+                    this.push(null);
+                } else {
+                    this.push(Buffer.from(value));
+                }
+            },
+        });
+    }
+
+    private isHtmlResponse(response: Response): boolean {
+        const contentType = response.headers.get('content-type') || '';
+        return contentType.toLowerCase().includes('text/html');
+    }
+
+    private async getDirectDownloadStream(
+        fileId: string,
+        apiErrorMessage: string,
+    ): Promise<Readable> {
+        const directResponse = await fetch(this.getDirectUrl(fileId));
+
+        if (!directResponse.ok || this.isHtmlResponse(directResponse)) {
+            const directError = await this.readDriveError(
+                directResponse,
+                'Direct Google Drive download failed',
+            );
+            throw new Error(`${apiErrorMessage}; ${directError}`);
+        }
+
+        return this.createNodeStream(directResponse.body);
+    }
+
     /**
      * Extract folder ID from Google Drive URL or return as-is if already an ID
      */
@@ -51,9 +119,9 @@ export class GoogleDriveService {
         try {
             const response = await fetch(url);
             if (!response.ok) {
-                const error = await response.json();
-                this.logger.error(`Google Drive API error: ${JSON.stringify(error)}`);
-                throw new Error(error.error?.message || 'Failed to list files');
+                const message = await this.readDriveError(response, 'Failed to list files');
+                this.logger.error(`Google Drive API error: ${message}`);
+                throw new Error(message);
             }
 
             const data = await response.json();
@@ -77,8 +145,7 @@ export class GoogleDriveService {
                 if (response.status === 404) {
                     throw new NotFoundException(`File with ID "${fileId}" not found`);
                 }
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Failed to get file metadata');
+                throw new Error(await this.readDriveError(response, 'Failed to get file metadata'));
             }
 
             return response.json();
@@ -105,29 +172,21 @@ export class GoogleDriveService {
                 if (response.status === 404) {
                     throw new NotFoundException(`File with ID "${fileId}" not found`);
                 }
-                const error = await response.json();
-                throw new Error(error.error?.message || 'Failed to download file');
-            }
+                const apiErrorMessage = await this.readDriveError(
+                    response,
+                    'Google Drive download failed',
+                );
+                this.logger.warn(`${apiErrorMessage}; trying direct Google Drive download fallback`);
 
-            const webStream = response.body;
-            if (!webStream) {
-                throw new Error('No response body');
+                return {
+                    stream: await this.getDirectDownloadStream(fileId, apiErrorMessage),
+                    mimeType: metadata.mimeType,
+                    fileName: metadata.name,
+                };
             }
-
-            const reader = webStream.getReader();
-            const nodeStream = new Readable({
-                async read() {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        this.push(null);
-                    } else {
-                        this.push(Buffer.from(value));
-                    }
-                },
-            });
 
             return {
-                stream: nodeStream,
+                stream: this.createNodeStream(response.body),
                 mimeType: metadata.mimeType,
                 fileName: metadata.name,
             };
