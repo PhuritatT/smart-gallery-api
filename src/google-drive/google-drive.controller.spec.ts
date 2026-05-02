@@ -5,6 +5,7 @@ describe('GoogleDriveController', () => {
   let controller: GoogleDriveController;
   let googleDriveService: {
     getFileStream: jest.Mock;
+    listFiles: jest.Mock;
   };
 
   const createResponse = () => {
@@ -22,6 +23,7 @@ describe('GoogleDriveController', () => {
   beforeEach(() => {
     googleDriveService = {
       getFileStream: jest.fn(),
+      listFiles: jest.fn(),
     };
 
     controller = new GoogleDriveController(
@@ -39,7 +41,7 @@ describe('GoogleDriveController', () => {
 
     await controller.proxyFile('file-123', res);
 
-    expect(googleDriveService.getFileStream).toHaveBeenCalledWith('file-123');
+    expect(googleDriveService.getFileStream).toHaveBeenCalledWith('file-123', {});
     expect(set).toHaveBeenCalledWith(
       expect.objectContaining({
         'Content-Disposition':
@@ -47,6 +49,38 @@ describe('GoogleDriveController', () => {
       }),
     );
     expect(pipe).toHaveBeenCalledWith(res);
+  });
+
+  it('passes cache context query params to the proxy service', async () => {
+    const { res, set, stream } = createResponse();
+    googleDriveService.getFileStream.mockResolvedValue({
+      stream,
+      mimeType: 'image/jpeg',
+      fileName: 'summer photo.jpg',
+    });
+
+    await controller.proxyFile(
+      'file-123',
+      res,
+      '1',
+      'folder-123',
+      'Summer Album',
+      'summer photo.jpg',
+      'image/jpeg',
+    );
+
+    expect(googleDriveService.getFileStream).toHaveBeenCalledWith('file-123', {
+      folderId: 'folder-123',
+      folderName: 'Summer Album',
+      fileName: 'summer photo.jpg',
+      mimeType: 'image/jpeg',
+    });
+    expect(set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'Content-Disposition':
+          'attachment; filename="summer photo.jpg"; filename*=UTF-8\'\'summer%20photo.jpg',
+      }),
+    );
   });
 
   it.each(['1', 'true', 'yes'])(
