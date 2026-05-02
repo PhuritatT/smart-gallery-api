@@ -1,6 +1,7 @@
 // Auth Controller - Updated: 2026-01-02 - Admin creation with username only
 import { Controller, Post, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiProperty } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { AuthService, AuthResponse } from './auth.service';
 import { RegisterDto, LoginDto } from './dto';
 import { Public } from '../common/decorators/public.decorator';
@@ -30,6 +31,7 @@ export class AuthController {
     constructor(private readonly authService: AuthService) { }
 
     @Public()
+    @Throttle({ default: { ttl: 60000, limit: 10 } })
     @Post('register')
     @ApiOperation({ summary: 'Register a new user' })
     @ApiResponse({ status: 201, description: 'User registered successfully' })
@@ -39,6 +41,7 @@ export class AuthController {
     }
 
     @Public()
+    @Throttle({ default: { ttl: 60000, limit: 5 } })
     @Post('login')
     @HttpCode(HttpStatus.OK)
     @ApiOperation({ summary: 'Login with email or username' })
@@ -49,9 +52,10 @@ export class AuthController {
     }
 
     @Public()
+    @Throttle({ default: { ttl: 60000, limit: 3 } })
     @Post('create-admin')
     @HttpCode(HttpStatus.CREATED)
-    @ApiOperation({ summary: 'Create an admin account (requires JWT_SECRET)' })
+    @ApiOperation({ summary: 'Create an admin account (requires ADMIN_SECRET_KEY)' })
     @ApiResponse({ status: 201, description: 'Admin created successfully' })
     @ApiResponse({ status: 401, description: 'Invalid secret key' })
     async createAdmin(@Body() createAdminDto: CreateAdminDto): Promise<AuthResponse> {

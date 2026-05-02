@@ -5,17 +5,32 @@ import {
     Query,
     Res,
     BadRequestException,
+    ForbiddenException,
     Headers,
+    Inject,
+    forwardRef,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiResponse } from '@nestjs/swagger';
 import { Response } from 'express';
 import { DriveFileStreamContext, GoogleDriveService } from './google-drive.service';
+import { AlbumsService } from '../albums/albums.service';
 import { Public } from '../common/decorators/public.decorator';
 
 @ApiTags('Google Drive')
 @Controller('drive')
 export class GoogleDriveController {
-    constructor(private readonly googleDriveService: GoogleDriveService) { }
+    constructor(
+        private readonly googleDriveService: GoogleDriveService,
+        @Inject(forwardRef(() => AlbumsService))
+        private readonly albumsService: AlbumsService,
+    ) { }
+
+    private async assertFolderRegistered(folderId: string): Promise<void> {
+        const registered = await this.albumsService.isFolderIdRegistered(folderId);
+        if (!registered) {
+            throw new ForbiddenException('Access to this folder is not permitted');
+        }
+    }
 
     private sanitizeFilename(fileName: string): string {
         return fileName.replace(/[\r\n"]/g, '').trim() || 'download';
@@ -62,6 +77,8 @@ export class GoogleDriveController {
             throw new BadRequestException('folderId is required');
         }
 
+        await this.assertFolderRegistered(folderId);
+
         const files = await this.googleDriveService.listFiles(folderId);
         return { files };
     }
@@ -97,6 +114,10 @@ export class GoogleDriveController {
             throw new BadRequestException('fileId is required');
         }
 
+        if (folderId) {
+            await this.assertFolderRegistered(folderId);
+        }
+
         const { stream, mimeType: responseMimeType, fileName: responseFileName } =
             await this.googleDriveService.getFileStream(
                 fileId,
@@ -105,15 +126,12 @@ export class GoogleDriveController {
         const sanitizedFileName = this.sanitizeFilename(responseFileName);
         const dispositionType = this.shouldDownload(download) ? 'attachment' : 'inline';
 
-        // Set headers for image response
         res.set({
             'Content-Type': responseMimeType,
             'Content-Disposition': `${dispositionType}; filename="${sanitizedFileName}"; filename*=UTF-8''${encodeURIComponent(sanitizedFileName)}`,
-            'Cache-Control': 'public, max-age=86400', // Cache for 24 hours
-            'Access-Control-Allow-Origin': '*', // Allow CORS for face-api.js
+            'Cache-Control': 'public, max-age=86400',
         });
 
-        // Pipe the stream to response
         stream.pipe(res);
     }
 
@@ -141,6 +159,10 @@ export class GoogleDriveController {
     ) {
         if (!fileId) {
             throw new BadRequestException('fileId is required');
+        }
+
+        if (folderId) {
+            await this.assertFolderRegistered(folderId);
         }
 
         res.set({

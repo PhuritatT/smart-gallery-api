@@ -3,6 +3,7 @@ import {
     Injectable,
     UnauthorizedException,
     ConflictException,
+    InternalServerErrorException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -130,7 +131,10 @@ export class AuthService {
         password: string,
         secretKey: string,
     ): Promise<AuthResponse> {
-        const adminSecretKey = process.env.JWT_SECRET || 'your-secret-key';
+        const adminSecretKey = process.env.ADMIN_SECRET_KEY;
+        if (!adminSecretKey) {
+            throw new InternalServerErrorException('Admin secret key is not configured');
+        }
         if (secretKey !== adminSecretKey) {
             throw new UnauthorizedException('Invalid secret key');
         }

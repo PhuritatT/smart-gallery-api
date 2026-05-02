@@ -3,20 +3,23 @@ import {
     Controller,
     Post,
     UseInterceptors,
+    UseGuards,
     UploadedFile,
     BadRequestException,
-    Inject,
+    Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { v4 as uuidv4 } from 'uuid';
 import { extname } from 'path';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 @ApiTags('Uploads')
 @Controller('uploads')
 export class UploadsController {
+    private readonly logger = new Logger(UploadsController.name);
     private r2Client: S3Client;
 
     constructor(private configService: ConfigService) {
@@ -25,7 +28,7 @@ export class UploadsController {
         const accessKeyId = this.configService.get<string>('R2_ACCESS_KEY_ID');
         const secretAccessKey = this.configService.get<string>('R2_SECRET_ACCESS_KEY');
 
-        console.log('R2 Config:', { endpoint, accessKeyId: accessKeyId ? 'SET' : 'NOT SET' });
+        this.logger.log(`R2 Config: endpoint=${endpoint ? 'SET' : 'NOT SET'} accessKeyId=${accessKeyId ? 'SET' : 'NOT SET'}`);
 
         this.r2Client = new S3Client({
             region: 'auto',
@@ -38,8 +41,10 @@ export class UploadsController {
         });
     }
 
+    @UseGuards(JwtAuthGuard)
+    @ApiBearerAuth()
     @Post('image')
-    @ApiOperation({ summary: 'Upload an image file to R2' })
+    @ApiOperation({ summary: 'Upload an image file to R2 (requires authentication)' })
     @ApiConsumes('multipart/form-data')
     @ApiBody({
         schema: {
@@ -54,6 +59,7 @@ export class UploadsController {
     })
     @ApiResponse({ status: 201, description: 'Image uploaded successfully' })
     @ApiResponse({ status: 400, description: 'Invalid file type' })
+    @ApiResponse({ status: 401, description: 'Unauthorized' })
     @UseInterceptors(
         FileInterceptor('file', {
             fileFilter: (req, file, callback) => {
@@ -67,15 +73,9 @@ export class UploadsController {
                     'image/tiff',
                 ];
 
-                console.log('Upload file info:', {
-                    originalname: file.originalname,
-                    mimetype: file.mimetype,
-                });
-
                 if (allowedMimeTypes.includes(file.mimetype)) {
                     callback(null, true);
                 } else {
-                    console.log('Rejected file type:', file.mimetype);
                     callback(new BadRequestException(`Invalid file type: ${file.mimetype}`), false);
                 }
             },
@@ -85,8 +85,6 @@ export class UploadsController {
         }),
     )
     async uploadImage(@UploadedFile() file: Express.Multer.File) {
-        console.log('uploadImage called, file:', file ? 'received' : 'null');
-
         if (!file) {
             throw new BadRequestException('No file uploaded.');
         }
@@ -98,11 +96,10 @@ export class UploadsController {
         const bucketName = this.configService.get<string>('R2_BUCKET_NAME');
         const publicUrl = this.configService.get<string>('R2_PUBLIC_URL');
 
-        // Generate unique filename
         const ext = extname(file.originalname).toLowerCase() || '.jpg';
         const filename = `covers/${uuidv4()}${ext}`;
 
-        console.log('Uploading to R2:', { bucketName, filename, size: file.size });
+        this.logger.log(`Uploading file to R2: size=${file.size} type=${file.mimetype}`);
 
         try {
             await this.r2Client.send(
@@ -115,7 +112,7 @@ export class UploadsController {
             );
 
             const url = `${publicUrl}/${filename}`;
-            console.log('Upload successful:', url);
+            this.logger.log('R2 upload successful');
 
             return {
                 success: true,
@@ -125,7 +122,7 @@ export class UploadsController {
                 url,
             };
         } catch (error) {
-            console.error('R2 Upload Error:', error);
+            this.logger.error(`R2 upload failed: ${error.message}`);
             throw new BadRequestException(`Failed to upload to R2: ${error.message}`);
         }
     }

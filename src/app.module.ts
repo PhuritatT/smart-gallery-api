@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { AlbumsModule } from './albums/albums.module';
@@ -38,6 +39,14 @@ import { Album } from './albums/entities/album.entity';
       inject: [ConfigService],
     }),
 
+    // Rate limiting — global default: 60 req / 60s
+    ThrottlerModule.forRoot([
+      {
+        ttl: 60000,
+        limit: 60,
+      },
+    ]),
+
     // Feature modules
     AuthModule,
     UsersModule,
@@ -46,6 +55,11 @@ import { Album } from './albums/entities/album.entity';
     UploadsModule,
   ],
   providers: [
+    // Global Throttler Guard (rate limiting)
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
     // Global JWT Auth Guard
     {
       provide: APP_GUARD,
