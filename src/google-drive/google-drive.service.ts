@@ -1,17 +1,29 @@
 // Google Drive Service - Updated: 2026-01-02
 // Added modifiedTime to file listing for sorting
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Readable } from 'stream';
+import { PassThrough, Readable } from 'stream';
 import { DriveFile } from './interfaces/drive-file.interface';
+import { DriveImageCacheService } from './drive-image-cache.service';
+
+export interface DriveFileStreamContext {
+    folderId?: string;
+    folderName?: string;
+    fileName?: string;
+    mimeType?: string;
+}
 
 @Injectable()
 export class GoogleDriveService {
     private readonly logger = new Logger(GoogleDriveService.name);
     private readonly apiKey: string;
     private readonly baseUrl = 'https://www.googleapis.com/drive/v3';
+    private readonly folderNameCache = new Map<string, string | null>();
 
-    constructor(private readonly configService: ConfigService) {
+    constructor(
+        private readonly configService: ConfigService,
+        @Optional() private readonly imageCacheService?: DriveImageCacheService,
+    ) {
         this.apiKey = this.configService.get<string>('GOOGLE_API_KEY') || '';
         if (!this.apiKey) {
             this.logger.warn('GOOGLE_API_KEY is not configured');
@@ -125,7 +137,9 @@ export class GoogleDriveService {
             }
 
             const data = await response.json();
-            return data.files || [];
+            const files = data.files || [];
+            this.startFolderPrewarm(extractedId, files);
+            return files;
         } catch (error) {
             this.logger.error(`Error listing files: ${error}`);
             throw error;
@@ -158,35 +172,35 @@ export class GoogleDriveService {
     /**
      * Get file content as stream (for proxy to bypass CORS)
      */
-    async getFileStream(fileId: string): Promise<{
+    async getFileStream(fileId: string, context: DriveFileStreamContext = {}): Promise<{
         stream: Readable;
         mimeType: string;
         fileName: string;
     }> {
-        const metadata = await this.getFileMetadata(fileId);
-        const url = `${this.baseUrl}/files/${fileId}?alt=media&key=${this.apiKey}`;
-
         try {
-            const response = await fetch(url);
-            if (!response.ok) {
-                if (response.status === 404) {
-                    throw new NotFoundException(`File with ID "${fileId}" not found`);
-                }
-                const apiErrorMessage = await this.readDriveError(
-                    response,
-                    'Google Drive download failed',
-                );
-                this.logger.warn(`${apiErrorMessage}; trying direct Google Drive download fallback`);
+            const metadata = await this.resolveMetadata(fileId, context);
+            const cacheKey = await this.getCacheKey(fileId, metadata, context);
 
+            if (cacheKey && this.imageCacheService?.isEnabled()) {
+                const cachedImage = await this.imageCacheService.getCachedImage(cacheKey);
+                if (cachedImage) {
+                    return {
+                        stream: cachedImage.stream,
+                        mimeType: cachedImage.mimeType || metadata.mimeType,
+                        fileName: cachedImage.fileName || metadata.name,
+                    };
+                }
+
+                const stream = await this.getGoogleMediaStream(fileId);
                 return {
-                    stream: await this.getDirectDownloadStream(fileId, apiErrorMessage),
+                    stream: this.uploadWhileStreaming(stream, cacheKey, metadata.mimeType, metadata.name),
                     mimeType: metadata.mimeType,
                     fileName: metadata.name,
                 };
             }
 
             return {
-                stream: this.createNodeStream(response.body),
+                stream: await this.getGoogleMediaStream(fileId),
                 mimeType: metadata.mimeType,
                 fileName: metadata.name,
             };
@@ -213,20 +227,155 @@ export class GoogleDriveService {
      */
     async getFolderName(folderId: string): Promise<string | null> {
         const extractedId = this.extractFolderId(folderId);
+        if (this.folderNameCache.has(extractedId)) {
+            return this.folderNameCache.get(extractedId) || null;
+        }
+
         const url = `${this.baseUrl}/files/${extractedId}?fields=name&key=${this.apiKey}`;
 
         try {
             const response = await fetch(url);
             if (!response.ok) {
                 this.logger.warn(`Could not get folder name for ${extractedId}`);
+                this.folderNameCache.set(extractedId, null);
                 return null;
             }
 
             const data = await response.json();
+            this.folderNameCache.set(extractedId, data.name || null);
             return data.name || null;
         } catch (error) {
             this.logger.error(`Error getting folder name: ${error}`);
+            this.folderNameCache.set(extractedId, null);
             return null;
+        }
+    }
+
+    private async resolveMetadata(
+        fileId: string,
+        context: DriveFileStreamContext,
+    ): Promise<DriveFile> {
+        if (context.fileName && context.mimeType) {
+            return {
+                id: fileId,
+                name: context.fileName,
+                mimeType: context.mimeType,
+            };
+        }
+
+        return this.getFileMetadata(fileId);
+    }
+
+    private async getCacheKey(
+        fileId: string,
+        metadata: DriveFile,
+        context: DriveFileStreamContext,
+    ): Promise<string | null> {
+        if (!this.imageCacheService?.isEnabled() || !context.folderId) {
+            return null;
+        }
+
+        const folderName =
+            context.folderName || (await this.getFolderName(context.folderId)) || context.folderId;
+
+        return this.imageCacheService.getCacheKey({
+            folderId: context.folderId,
+            folderName,
+            fileId,
+            fileName: metadata.name,
+        });
+    }
+
+    private async getGoogleMediaStream(fileId: string): Promise<Readable> {
+        const url = `${this.baseUrl}/files/${fileId}?alt=media&key=${this.apiKey}`;
+        const response = await fetch(url);
+
+        if (!response.ok || this.isHtmlResponse(response)) {
+            if (response.status === 404) {
+                throw new NotFoundException(`File with ID "${fileId}" not found`);
+            }
+            const apiErrorMessage = await this.readDriveError(
+                response,
+                'Google Drive download failed',
+            );
+            this.logger.warn(`${apiErrorMessage}; trying direct Google Drive download fallback`);
+            return this.getDirectDownloadStream(fileId, apiErrorMessage);
+        }
+
+        return this.createNodeStream(response.body);
+    }
+
+    private uploadWhileStreaming(
+        source: Readable,
+        cacheKey: string,
+        mimeType: string,
+        fileName: string,
+    ): Readable {
+        const responseStream = new PassThrough();
+        const cacheStream = new PassThrough();
+
+        source.on('error', (error) => {
+            responseStream.destroy(error);
+            cacheStream.destroy(error);
+        });
+
+        source.pipe(responseStream);
+        source.pipe(cacheStream);
+
+        void this.imageCacheService?.uploadStream(cacheKey, cacheStream, mimeType, fileName).catch(() => {
+            this.logger.warn(`R2 cache upload failed for key ${cacheKey}`);
+        });
+
+        return responseStream;
+    }
+
+    private startFolderPrewarm(folderId: string, files: DriveFile[]): void {
+        if (!this.imageCacheService?.isEnabled()) return;
+
+        void this.prewarmFolderCache(folderId, files).catch((error) => {
+            this.logger.warn(`R2 folder prewarm failed for folder ${folderId}: ${error}`);
+        });
+    }
+
+    private async prewarmFolderCache(folderId: string, files: DriveFile[]): Promise<void> {
+        const imageFiles = files.filter((file) => file.mimeType?.startsWith('image/'));
+        if (imageFiles.length === 0 || !this.imageCacheService?.isEnabled()) return;
+
+        const folderName = (await this.getFolderName(folderId)) || folderId;
+        let nextIndex = 0;
+        const workerCount = Math.min(2, imageFiles.length);
+
+        await Promise.all(
+            Array.from({ length: workerCount }, async () => {
+                while (nextIndex < imageFiles.length) {
+                    const file = imageFiles[nextIndex++];
+                    await this.prewarmFileCache(folderId, folderName, file);
+                }
+            }),
+        );
+    }
+
+    private async prewarmFileCache(
+        folderId: string,
+        folderName: string,
+        file: DriveFile,
+    ): Promise<void> {
+        if (!this.imageCacheService?.isEnabled()) return;
+
+        const cacheKey = this.imageCacheService.getCacheKey({
+            folderId,
+            folderName,
+            fileId: file.id,
+            fileName: file.name,
+        });
+
+        if (await this.imageCacheService.exists(cacheKey)) return;
+
+        try {
+            const stream = await this.getGoogleMediaStream(file.id);
+            await this.imageCacheService.uploadStream(cacheKey, stream, file.mimeType, file.name);
+        } catch (error) {
+            this.logger.warn(`R2 prewarm skipped file ${file.id}: ${error}`);
         }
     }
 }
