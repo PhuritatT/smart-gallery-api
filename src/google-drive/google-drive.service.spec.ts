@@ -10,6 +10,7 @@ describe('GoogleDriveService', () => {
     isEnabled: jest.Mock;
     getCacheKey: jest.Mock;
     getCachedImage: jest.Mock;
+    getSignedReadUrl: jest.Mock;
     exists: jest.Mock;
     uploadStream: jest.Mock;
   };
@@ -22,6 +23,7 @@ describe('GoogleDriveService', () => {
       isEnabled: jest.fn().mockReturnValue(false),
       getCacheKey: jest.fn().mockReturnValue('images-cache/summer-album-folder-123/file-123-photo.jpg'),
       getCachedImage: jest.fn(),
+      getSignedReadUrl: jest.fn(),
       exists: jest.fn(),
       uploadStream: jest.fn().mockResolvedValue(undefined),
     };
@@ -240,5 +242,95 @@ describe('GoogleDriveService', () => {
       'image/jpeg',
       'photo.jpg',
     );
+  });
+
+  it('returns a signed R2 URL when cached image exists', async () => {
+    cacheService.isEnabled.mockReturnValue(true);
+    cacheService.exists.mockResolvedValue(true);
+    cacheService.getSignedReadUrl.mockResolvedValue({
+      url: 'https://r2.example.com/signed-photo-url',
+      expiresAt: new Date('2026-05-02T13:00:00.000Z'),
+    });
+
+    const result = await service.getCachedFileUrl(
+      'file-123',
+      {
+        folderId: 'folder-123',
+        folderName: 'Summer Album',
+        fileName: 'photo.jpg',
+        mimeType: 'image/jpeg',
+      },
+      {
+        baseUrl: 'https://api.example.com',
+        download: true,
+      },
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      url: 'https://r2.example.com/signed-photo-url',
+      source: 'r2',
+      expiresAt: '2026-05-02T13:00:00.000Z',
+    });
+    expect(cacheService.getSignedReadUrl).toHaveBeenCalledWith(
+      'images-cache/summer-album-folder-123/file-123-photo.jpg',
+      {
+        fileName: 'photo.jpg',
+        mimeType: 'image/jpeg',
+        download: true,
+      },
+    );
+  });
+
+  it('returns proxy fallback URL when cached image is missing', async () => {
+    cacheService.isEnabled.mockReturnValue(true);
+    cacheService.exists.mockResolvedValue(false);
+
+    const result = await service.getCachedFileUrl(
+      'file-123',
+      {
+        folderId: 'folder-123',
+        folderName: 'Summer Album',
+        fileName: 'photo.jpg',
+        mimeType: 'image/jpeg',
+      },
+      {
+        baseUrl: 'https://api.example.com',
+        download: true,
+      },
+    );
+
+    expect(cacheService.getSignedReadUrl).not.toHaveBeenCalled();
+    expect(result.source).toBe('proxy');
+    expect(result.url).toBe(
+      'https://api.example.com/drive/proxy?fileId=file-123&download=1&folderId=folder-123&folderName=Summer+Album&fileName=photo.jpg&mimeType=image%2Fjpeg',
+    );
+  });
+
+  it('uses a short TTL cache for repeated file listings', async () => {
+    cacheService.isEnabled.mockReturnValue(false);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          files: [
+            {
+              id: 'file-123',
+              name: 'photo.jpg',
+              mimeType: 'image/jpeg',
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      ),
+    );
+
+    const first = await service.listFiles('folder-123');
+    const second = await service.listFiles('folder-123');
+
+    expect(first).toEqual(second);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

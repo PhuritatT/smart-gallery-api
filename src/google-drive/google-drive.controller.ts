@@ -5,6 +5,7 @@ import {
     Query,
     Res,
     BadRequestException,
+    Headers,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiResponse } from '@nestjs/swagger';
 import { Response } from 'express';
@@ -24,6 +25,17 @@ export class GoogleDriveController {
         if (!download) return false;
 
         return ['1', 'true', 'yes'].includes(download.toLowerCase());
+    }
+
+    private getHeaderValue(value: string | string[] | undefined): string | undefined {
+        return Array.isArray(value) ? value[0] : value;
+    }
+
+    private getRequestBaseUrl(headers: Record<string, string | string[] | undefined>): string {
+        const host = this.getHeaderValue(headers['x-forwarded-host']) || this.getHeaderValue(headers.host);
+        const protocol = this.getHeaderValue(headers['x-forwarded-proto']) || 'https';
+
+        return host ? `${protocol}://${host}` : '';
     }
 
     private buildStreamContext(
@@ -103,6 +115,47 @@ export class GoogleDriveController {
 
         // Pipe the stream to response
         stream.pipe(res);
+    }
+
+    @Public()
+    @Get('cache-url')
+    @ApiOperation({
+        summary: 'Get direct cached image URL when available',
+        description: 'Returns a short-lived R2 signed URL on cache hit, or proxy fallback URL on cache miss.',
+    })
+    @ApiQuery({ name: 'fileId', required: true, description: 'Google Drive file ID' })
+    @ApiQuery({ name: 'download', required: false, description: 'When set, URL should download the image' })
+    @ApiQuery({ name: 'folderId', required: false, description: 'Google Drive folder ID for R2 cache lookup' })
+    @ApiQuery({ name: 'folderName', required: false, description: 'Google Drive folder name for R2 cache key' })
+    @ApiQuery({ name: 'fileName', required: false, description: 'Image filename for R2 cache key' })
+    @ApiQuery({ name: 'mimeType', required: false, description: 'Image MIME type for cached responses' })
+    async getCachedFileUrl(
+        @Query('fileId') fileId: string,
+        @Query('download') download: string | undefined,
+        @Query('folderId') folderId: string | undefined,
+        @Query('folderName') folderName: string | undefined,
+        @Query('fileName') fileName: string | undefined,
+        @Query('mimeType') mimeType: string | undefined,
+        @Headers() headers: Record<string, string | string[] | undefined>,
+        @Res({ passthrough: true }) res: Response,
+    ) {
+        if (!fileId) {
+            throw new BadRequestException('fileId is required');
+        }
+
+        res.set({
+            'Cache-Control': 'private, max-age=60',
+            Vary: 'Origin',
+        });
+
+        return this.googleDriveService.getCachedFileUrl(
+            fileId,
+            this.buildStreamContext(folderId, folderName, fileName, mimeType),
+            {
+                baseUrl: this.getRequestBaseUrl(headers),
+                download: this.shouldDownload(download),
+            },
+        );
     }
 
     @Public()
