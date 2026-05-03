@@ -61,6 +61,16 @@ export class DriveImageCacheService {
         },
       });
     }
+
+    // Prune expired signed URLs every 5 minutes
+    setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.signedUrlCache) {
+        if (entry.expiresAt.getTime() < now) {
+          this.signedUrlCache.delete(key);
+        }
+      }
+    }, 5 * 60 * 1000).unref();
   }
 
   isEnabled(): boolean {
