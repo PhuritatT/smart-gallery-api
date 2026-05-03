@@ -24,11 +24,12 @@ export class AlbumsService {
      * Create a new album - fetches folder name from Google Drive
      */
     async create(createAlbumDto: CreateAlbumDto, user: User): Promise<Album> {
-        // Fetch folder name from Google Drive
-        const folderName = await this.googleDriveService.getFolderName(createAlbumDto.driveFolderId);
+        const driveFolderId = this.googleDriveService.extractFolderId(createAlbumDto.driveFolderId);
+        const folderName = await this.googleDriveService.getFolderName(driveFolderId);
 
         const album = this.albumsRepository.create({
             ...createAlbumDto,
+            driveFolderId,
             userId: user.id,
             driveFolderName: folderName,
         });
@@ -75,8 +76,9 @@ export class AlbumsService {
      * Check if a folderId belongs to any active album in the DB
      */
     async isFolderIdRegistered(folderId: string): Promise<boolean> {
+        const normalizedId = this.googleDriveService.extractFolderId(folderId);
         const count = await this.albumsRepository.count({
-            where: { driveFolderId: folderId },
+            where: { driveFolderId: normalizedId },
         });
         return count > 0;
     }
@@ -92,10 +94,12 @@ export class AlbumsService {
         const album = await this.findOne(id);
         this.checkOwnership(album, user);
 
-        // If folder ID changed, update folder name too
-        if (updateAlbumDto.driveFolderId && updateAlbumDto.driveFolderId !== album.driveFolderId) {
-            const folderName = await this.googleDriveService.getFolderName(updateAlbumDto.driveFolderId);
-            album.driveFolderName = folderName;
+        // If folder ID changed, normalize it and update folder name too
+        if (updateAlbumDto.driveFolderId) {
+            updateAlbumDto.driveFolderId = this.googleDriveService.extractFolderId(updateAlbumDto.driveFolderId);
+            if (updateAlbumDto.driveFolderId !== album.driveFolderId) {
+                album.driveFolderName = await this.googleDriveService.getFolderName(updateAlbumDto.driveFolderId);
+            }
         }
 
         Object.assign(album, updateAlbumDto);
