@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { PassThrough, Readable } from 'stream';
 import { DriveFile } from './interfaces/drive-file.interface';
 import { DriveImageCacheService } from './drive-image-cache.service';
+import { RedisService } from '../redis/redis.service';
 
 export interface DriveFileStreamContext {
     folderId?: string;
@@ -30,13 +31,13 @@ export class GoogleDriveService {
     private readonly apiKey: string;
     private readonly baseUrl = 'https://www.googleapis.com/drive/v3';
     private readonly folderNameCache = new Map<string, string | null>();
-    private readonly fileListCache = new Map<string, { files: DriveFile[]; expiresAt: number }>();
     private readonly prewarmInFlight = new Set<string>();
-    private readonly fileListCacheTtlMs = 30000;
+    private readonly fileListCacheTtlSeconds = 300; // 5 minutes
 
     constructor(
         private readonly configService: ConfigService,
         @Optional() private readonly imageCacheService?: DriveImageCacheService,
+        @Optional() private readonly redisService?: RedisService,
     ) {
         this.apiKey = this.configService.get<string>('GOOGLE_API_KEY') || '';
         if (!this.apiKey) {
@@ -135,17 +136,18 @@ export class GoogleDriveService {
      */
     async listFiles(folderId: string): Promise<DriveFile[]> {
         const extractedId = this.extractFolderId(folderId);
-        const cached = this.fileListCache.get(extractedId);
+        const redisKey = `drive:files:${extractedId}`;
 
-        if (cached && cached.expiresAt > Date.now()) {
-            this.startFolderPrewarm(extractedId, cached.files);
-            return cached.files;
+        if (this.redisService?.isEnabled()) {
+            const cached = await this.redisService.get<DriveFile[]>(redisKey);
+            if (cached) {
+                this.startFolderPrewarm(extractedId, cached);
+                return cached;
+            }
         }
 
         const query = `'${extractedId}' in parents and mimeType contains 'image/' and trashed = false`;
-        // Added modifiedTime for sorting
         const fields = 'files(id,name,mimeType,thumbnailLink,webContentLink,modifiedTime,createdTime)';
-
         const url = `${this.baseUrl}/files?q=${encodeURIComponent(query)}&fields=${fields}&key=${this.apiKey}&pageSize=1000&orderBy=modifiedTime desc`;
 
         try {
@@ -157,11 +159,12 @@ export class GoogleDriveService {
             }
 
             const data = await response.json();
-            const files = data.files || [];
-            this.fileListCache.set(extractedId, {
-                files,
-                expiresAt: Date.now() + this.fileListCacheTtlMs,
-            });
+            const files: DriveFile[] = data.files || [];
+
+            if (this.redisService?.isEnabled()) {
+                await this.redisService.set(redisKey, files, this.fileListCacheTtlSeconds);
+            }
+
             this.startFolderPrewarm(extractedId, files);
             return files;
         } catch (error) {

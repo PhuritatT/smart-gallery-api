@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   GetObjectCommand,
@@ -9,6 +9,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'stream';
+import { RedisService } from '../redis/redis.service';
 
 interface CacheKeyInput {
   folderId: string;
@@ -34,16 +35,24 @@ interface SignedReadUrl {
   expiresAt: Date;
 }
 
+// Shape stored in Redis (Date serialised as ISO string)
+interface SignedReadUrlCached {
+  url: string;
+  expiresAt: string;
+}
+
 @Injectable()
 export class DriveImageCacheService {
   private readonly logger = new Logger(DriveImageCacheService.name);
   private readonly client?: S3Client;
   private readonly bucketName?: string;
-  private readonly signedUrlCache = new Map<string, SignedReadUrl>();
   private readonly signedUrlExpiresInSeconds = 300;
   private readonly signedUrlCacheSkewMs = 30000;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional() private readonly redisService?: RedisService,
+  ) {
     const endpoint = this.configService.get<string>('R2_ENDPOINT');
     const accessKeyId = this.configService.get<string>('R2_ACCESS_KEY_ID');
     const secretAccessKey = this.configService.get<string>('R2_SECRET_ACCESS_KEY');
@@ -61,16 +70,6 @@ export class DriveImageCacheService {
         },
       });
     }
-
-    // Prune expired signed URLs every 5 minutes
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, entry] of this.signedUrlCache) {
-        if (entry.expiresAt.getTime() < now) {
-          this.signedUrlCache.delete(key);
-        }
-      }
-    }, 5 * 60 * 1000).unref();
   }
 
   isEnabled(): boolean {
@@ -142,18 +141,20 @@ export class DriveImageCacheService {
     const dispositionType = options.download ? 'attachment' : 'inline';
     const sanitizedFileName = this.sanitizeContentDispositionFileName(options.fileName);
     const disposition = `${dispositionType}; filename="${sanitizedFileName}"; filename*=UTF-8''${encodeURIComponent(sanitizedFileName)}`;
-    const cacheKey = [
-      key,
-      options.mimeType,
-      disposition,
-    ].join('|');
-    const cached = this.signedUrlCache.get(cacheKey);
-    const now = Date.now();
+    const redisCacheKey = `r2:signed:${[key, options.mimeType, disposition].join('|')}`;
 
-    if (cached && cached.expiresAt.getTime() - this.signedUrlCacheSkewMs > now) {
-      return cached;
+    // Try Redis cache first
+    if (this.redisService?.isEnabled()) {
+      const cached = await this.redisService.get<SignedReadUrlCached>(redisCacheKey);
+      if (cached) {
+        const expiresAt = new Date(cached.expiresAt);
+        if (expiresAt.getTime() - this.signedUrlCacheSkewMs > Date.now()) {
+          return { url: cached.url, expiresAt };
+        }
+      }
     }
 
+    const now = Date.now();
     const expiresAt = new Date(now + this.signedUrlExpiresInSeconds * 1000);
     const command = new GetObjectCommand({
       Bucket: this.bucketName,
@@ -165,9 +166,17 @@ export class DriveImageCacheService {
     const url = await getSignedUrl(this.client, command, {
       expiresIn: this.signedUrlExpiresInSeconds,
     });
-    const signedUrl = { url, expiresAt };
+    const signedUrl: SignedReadUrl = { url, expiresAt };
 
-    this.signedUrlCache.set(cacheKey, signedUrl);
+    // Store in Redis — TTL slightly less than presign expiry
+    if (this.redisService?.isEnabled()) {
+      await this.redisService.set(
+        redisCacheKey,
+        { url, expiresAt: expiresAt.toISOString() } satisfies SignedReadUrlCached,
+        this.signedUrlExpiresInSeconds - 30,
+      );
+    }
+
     return signedUrl;
   }
 
@@ -196,7 +205,7 @@ export class DriveImageCacheService {
   private sanitizePathSegment(value: string, fallback: string): string {
     const cleaned = value
       .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[̀-ͯ]/g, '')
       .replace(/[\r\n"]/g, '')
       .replace(/[^a-zA-Z0-9._-]+/g, '-')
       .replace(/-{2,}/g, '-')
