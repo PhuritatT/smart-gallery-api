@@ -9,6 +9,7 @@ import { UsersModule } from './users/users.module';
 import { AlbumsModule } from './albums/albums.module';
 import { GoogleDriveModule } from './google-drive/google-drive.module';
 import { UploadsModule } from './uploads/uploads.module';
+import { FaceSearchModule } from './face-search/face-search.module';
 import { RedisModule } from './redis/redis.module';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard';
 import { RolesGuard } from './auth/guards/roles.guard';
@@ -57,6 +58,7 @@ import { Album } from './albums/entities/album.entity';
     AlbumsModule,
     GoogleDriveModule,
     UploadsModule,
+    FaceSearchModule,
   ],
   providers: [
     // Global Throttler Guard (rate limiting)
