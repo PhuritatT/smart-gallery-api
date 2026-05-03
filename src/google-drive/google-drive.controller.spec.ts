@@ -1,5 +1,6 @@
 import { GoogleDriveController } from './google-drive.controller';
 import { GoogleDriveService } from './google-drive.service';
+import { AlbumsService } from '../albums/albums.service';
 
 describe('GoogleDriveController', () => {
   let controller: GoogleDriveController;
@@ -8,6 +9,7 @@ describe('GoogleDriveController', () => {
     getCachedFileUrl: jest.Mock;
     listFiles: jest.Mock;
   };
+  let albumsService: { isFolderIdRegistered: jest.Mock };
 
   const createResponse = () => {
     const set = jest.fn();
@@ -28,8 +30,13 @@ describe('GoogleDriveController', () => {
       listFiles: jest.fn(),
     };
 
+    albumsService = {
+      isFolderIdRegistered: jest.fn().mockResolvedValue(true),
+    };
+
     controller = new GoogleDriveController(
       googleDriveService as unknown as GoogleDriveService,
+      albumsService as unknown as AlbumsService,
     );
   });
 

@@ -72,6 +72,16 @@ export class AlbumsService {
     }
 
     /**
+     * Check if a folderId belongs to any active album in the DB
+     */
+    async isFolderIdRegistered(folderId: string): Promise<boolean> {
+        const count = await this.albumsRepository.count({
+            where: { driveFolderId: folderId },
+        });
+        return count > 0;
+    }
+
+    /**
      * Update an album (owner or admin only)
      */
     async update(
