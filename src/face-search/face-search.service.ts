@@ -152,4 +152,22 @@ export class FaceSearchService {
       return { status: 'unreachable' };
     }
   }
+
+  /**
+   * Get model loading status
+   */
+  async modelStatus(): Promise<any> {
+    if (!this.isEnabled) {
+      return { enabled: false, message: 'Face search not configured' };
+    }
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/model-status`, {
+        headers: this.getHeaders(),
+      });
+      if (!response.ok) throw new Error(`Status ${response.status}`);
+      return response.json();
+    } catch {
+      return { loaded: false, error: 'unreachable' };
+    }
+  }
 }

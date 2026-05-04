@@ -43,6 +43,13 @@ export class FaceSearchController {
     return this.faceSearchService.getStats();
   }
 
+  @Public()
+  @Get('model-status')
+  @ApiOperation({ summary: 'Get model loading status' })
+  async modelStatus() {
+    return this.faceSearchService.modelStatus();
+  }
+
   @Post('index')
   @ApiOperation({
     summary: 'Index faces in a photo',
